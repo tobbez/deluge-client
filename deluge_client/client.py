@@ -179,6 +179,15 @@ class DelugeRPCClient(object):
             except ssl.SSLError:
                 raise CallTimeoutException()
 
+            if len(d) == 0:
+                # With the socket in blocking mode, recv should only return
+                # zero bytes if there was an error.
+                #
+                # Without this, the client would get stuck in an infinite loop
+                # if the connection was lost after a request was sent but
+                # before the response could be read.
+                raise ConnectionLostException()
+
             data += d
             if deluge_version == 2:
                 if expected_bytes is None:
