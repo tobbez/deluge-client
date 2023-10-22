@@ -55,8 +55,7 @@ class DelugeRPCClient(object):
         self.port = port
         self.username = username
         self.password = password
-        self.deluge_version = None
-        # This is only applicable if deluge_version is 2
+
         self.deluge_protocol_version = None
 
         self.decode_utf8 = decode_utf8
@@ -90,11 +89,8 @@ class DelugeRPCClient(object):
         self._connect()
         logger.debug('Connected to Deluge, detecting daemon version')
         self._detect_deluge_version()
-        logger.debug('Daemon version {} detected, logging in'.format(self.deluge_version))
-        if self.deluge_version == 2:
-            result = self.call('daemon.login', self.username, self.password, client_version='deluge-client')
-        else:
-            result = self.call('daemon.login', self.username, self.password)
+        logger.debug('Daemon version >= 2.0.0 detected, logging in')
+        result = self.call('daemon.login', self.username, self.password, client_version='deluge-client')
         logger.debug('Logged in with value %r' % result)
         self.connected = True
 
@@ -122,32 +118,27 @@ class DelugeRPCClient(object):
             self.connected = False
 
     def _detect_deluge_version(self):
-        if self.deluge_version is not None:
-            return
-
-        self._send_call(1, None, 'daemon.info')
-        self._send_call(2, None, 'daemon.info')
-        self._send_call(2, 1, 'daemon.info')
-        result = self._socket.recv(1)
-        if result[:1] == b'D':
-            # This is a protocol deluge 2.0 was using before release
-            self.deluge_version = 2
-            self.deluge_protocol_version = None
-            # If we need the specific version of deluge 2, this is it.
-            daemon_version = self._receive_response(2, None, partial_data=result)
-        elif ord(result[:1]) == 1:
-            self.deluge_version = 2
+        # Only support deluge version 2, RPC protocol version 1
+        self._send_call(1, 'daemon.info')
+        try:
+            result = self._socket.recv(1)
+        except TimeoutError:
+            raise Exception('Unsupported remote daemon version, or remote daemon stopped responding')
+        if ord(result[:1]) == 1:
             self.deluge_protocol_version = 1
             # If we need the specific version of deluge 2, this is it.
-            daemon_version = self._receive_response(2, 1, partial_data=result)
+            daemon_version = self._receive_response(1, partial_data=result)
         else:
-            self.deluge_version = 1
-            # Deluge 1 doesn't recover well from the bad request. Re-connect the socket.
-            self._socket.close()
-            self._create_socket()
-            self._connect()
+            # Currently (deluge 2.0.x, 2.1.x), the deluge daemon silently
+            # ignores calls with a protocol version different than the
+            # server's.
+            #
+            # As long as that logic stays the same, and the client is
+            # connecting to an actual deluge instance (and not some other
+            # service), the following statement should not be reached.
+            raise Exception(f'Received unsupported deluge protocol version {result!r}')
 
-    def _send_call(self, deluge_version, protocol_version, method, *args, **kwargs):
+    def _send_call(self, protocol_version, method, *args, **kwargs):
         self.request_id += 1
         if method == 'daemon.login':
             debug_args = list(args)
@@ -160,17 +151,10 @@ class DelugeRPCClient(object):
         req = ((self.request_id, method, args, kwargs), )
         req = zlib.compress(dumps(req))
 
-        if deluge_version == 2:
-            if protocol_version is None:
-                # This was a protocol for deluge 2 before they introduced protocol version numbers
-                self._socket.send(b'D' + struct.pack("!i", len(req)))
-            elif protocol_version == 1:
-                self._socket.send(struct.pack('!BI', protocol_version, len(req)))
-            else:
-                raise Exception('Deluge protocol version {} is not (yet) supported.'.format(protocol_version))
+        self._socket.send(struct.pack('!BI', protocol_version, len(req)))
         self._socket.send(req)
 
-    def _receive_response(self, deluge_version, protocol_version, partial_data=b''):
+    def _receive_response(self, protocol_version, partial_data=b''):
         expected_bytes = None
         data = partial_data
         while True:
@@ -189,37 +173,22 @@ class DelugeRPCClient(object):
                 raise ConnectionLostException()
 
             data += d
-            if deluge_version == 2:
-                if expected_bytes is None:
-                    if len(data) < 5:
-                        continue
-
-                    header = data[:MESSAGE_HEADER_SIZE]
-                    data = data[MESSAGE_HEADER_SIZE:]
-
-                    if protocol_version is None:
-                        if header[0] != b'D'[0]:
-                            raise InvalidHeaderException('Expected D as first byte in reply')
-                    elif ord(header[:1]) != protocol_version:
-                        raise InvalidHeaderException(
-                            'Expected protocol version ({}) as first byte in reply'.format(protocol_version)
-                        )
-
-                    if protocol_version is None:
-                        expected_bytes = struct.unpack('!i', header[1:])[0]
-                    else:
-                        expected_bytes = struct.unpack('!I', header[1:])[0]
-
-                if len(data) >= expected_bytes:
-                    data = zlib.decompress(data)
-                    break
-            else:
-                try:
-                    data = zlib.decompress(data)
-                except zlib.error:
-                    if not d:
-                        raise ConnectionLostException()
+            if expected_bytes is None:
+                if len(data) < 5:
                     continue
+
+                header = data[:MESSAGE_HEADER_SIZE]
+                data = data[MESSAGE_HEADER_SIZE:]
+
+                if ord(header[:1]) != protocol_version:
+                    raise InvalidHeaderException(
+                        'Expected protocol version ({}) as first byte in reply'.format(protocol_version)
+                    )
+
+                expected_bytes = struct.unpack('!I', header[1:])[0]
+
+            if len(data) >= expected_bytes:
+                data = zlib.decompress(data)
                 break
 
         data = list(loads(data, decode_utf8=self.decode_utf8))
@@ -227,15 +196,13 @@ class DelugeRPCClient(object):
         request_id = data.pop(0)
 
         if msg_type == RPC_ERROR:
-            if self.deluge_version == 2:
-                exception_type, exception_msg, _, traceback = data
-                # On deluge 2, exception arguments are sent as tuple
-                if self.decode_utf8:
-                    exception_msg = ', '.join(exception_msg)
-                else:
-                    exception_msg = b', '.join(exception_msg)
+            exception_type, exception_msg, _, traceback = data
+            # On deluge 2, exception arguments are sent as tuple
+            if self.decode_utf8:
+                exception_msg = ', '.join(exception_msg)
             else:
-                exception_type, exception_msg, traceback = data[0]
+                exception_msg = b', '.join(exception_msg)
+
             if self.decode_utf8:
                 exception = type(str(exception_type), (RemoteException, ), {})
                 exception_msg = '%s\n%s' % (exception_msg,
@@ -264,8 +231,8 @@ class DelugeRPCClient(object):
         tried_reconnect = False
         for _ in range(2):
             try:
-                self._send_call(self.deluge_version, self.deluge_protocol_version, method, *args, **kwargs)
-                return self._receive_response(self.deluge_version, self.deluge_protocol_version)
+                self._send_call(self.deluge_protocol_version, method, *args, **kwargs)
+                return self._receive_response(self.deluge_protocol_version)
             except (socket.error, ConnectionLostException, CallTimeoutException):
                 if self.automatic_reconnect:
                     if tried_reconnect:
